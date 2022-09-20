@@ -1,0 +1,42 @@
+host
+Human
+Environment
+Laboratory derived
+Manis javanica
+Rhinolophus shameli
+Rhinolophus pusillus
+Rhinolophus malayanus
+Rhinolophus marshalli
+Rhinolophus bat
+Rhinolophus affinis
+Rhinolophus sinicus
+Rhinolophus stheno
+Arctictis binturong
+Felis catus
+Nasua nasua
+Odocoileus virginianus
+Canis lupus familiaris
+Environmental
+Mustela furo
+Prionailurus viverrinus
+Gorilla gorilla gorilla
+Gorilla gorilla
+Mesocricetus auratus
+Hippopotamus amphibius
+Crocuta crocuta
+Prionailurus bengalensis euptilurus
+Panthera leo
+Mink
+Mustela putorius furo
+Neogale vison
+Chlorocebus sabaeus
+Mus musculus
+Mus musculus (BALB/c mice)
+Aonyx cinereus
+Manis pentadactyla
+Puma concolor
+Panthera uncia
+Panthera tigris jacksoni
+Panthera tigris
+Panthera tigris sondaica
+Panthera tigris tigris

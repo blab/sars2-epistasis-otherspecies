@@ -1,0 +1,6 @@
+Building DAG of jobs...
+InputFunctionException in line 368 of /nextstrain/build/workflow/snakemake_rules/main_workflow.smk:
+AttributeError: 'NoneType' object has no attribute 'get'
+Wildcards:
+build_name=adaptive-evolution_2021-05-15_asia
+subsample=africa
