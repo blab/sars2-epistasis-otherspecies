@@ -1,7 +1,24 @@
 """Small, shared functions used to generate inputs and parameters.
 """
 import datetime
+from itertools import product
+from shlex import (
+    quote as shquote,       # shquote() is used in this file and also other workflow files
+    split as shsplitwords,
+)
 from urllib.parse import urlsplit
+
+def shquotewords(s: str) -> str:
+    """
+    Split string *s* into (POSIX) shell words, quote each word, and join them
+    back into a string.
+
+    This is suitable for properly quoting multi-word, user-defined values which
+    should follow shell quoting and escaping semantics (e.g. to allow spaces in
+    single words) but not allow shell features like variable interpolation,
+    command substition, redirection, piping, etc.
+    """
+    return " ".join(shquote(word) for word in shsplitwords(s))
 
 def numeric_date(dt=None):
     """
@@ -26,13 +43,71 @@ def numeric_date(dt=None):
     return res
 
 def _get_subsampling_scheme_by_build_name(build_name):
-    return config["builds"][build_name].get("subsampling_scheme", build_name)
+    return config["builds"].get(build_name, {}).get("subsampling_scheme", build_name)
+
+def _get_skipped_inputs_for_diagnostic(wildcards):
+    """Build an argument for the diagnostic script with a list of inputs to skip.
+    """
+    inputs = config["inputs"]
+    diagnostics_key = "skip_diagnostics"
+
+    arg_parts = []
+    for input_name in inputs.keys():
+        skip_diagnostics = config["filter"].get(diagnostics_key, False)
+
+        if input_name in config["filter"] and diagnostics_key in config["filter"][input_name]:
+            skip_diagnostics = config["filter"][input_name][diagnostics_key]
+
+        if skip_diagnostics:
+            arg_parts.append(input_name)
+
+    if len(arg_parts) > 0:
+        argument = f"--skip-inputs {' '.join(arg_parts)}"
+    else:
+        argument = ""
+
+    return argument
+
+def _get_filter_min_length_query(wildcards):
+    """Build a sequence length filter query for each input, checking for
+    input-specific length requirements.
+    """
+    inputs = config["inputs"]
+    length_key = "min_length"
+
+    query_parts = []
+    for input_name in inputs.keys():
+        min_length = config["filter"][length_key]
+
+        if input_name in config["filter"] and length_key in config["filter"][input_name]:
+            min_length = config["filter"][input_name][length_key]
+
+        # We only annotate input-specific columns on metadata when there are
+        # multiple inputs.
+        if len(inputs) > 1:
+            # Input names can contain characters that make them invalid Python
+            # variable names. As such, we escape the column names with backticks
+            # as recommended by pandas:
+            #
+            # https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.query.html
+            query_parts.append(f"(`{input_name}` == 'yes' & _length >= {min_length})")
+        else:
+            query_parts.append(f"(_length >= {min_length})")
+
+    query = " | ".join(query_parts)
+    return f"--query {shquote(query)}"
 
 def _get_filter_value(wildcards, key):
-    default = config["filter"].get(key, "")
-    if wildcards["origin"] == "":
-        return default
-    return config["filter"].get(wildcards["origin"], {}).get(key, default)
+    for input_name in config["inputs"].keys():
+        if input_name in config["filter"] and key in config["filter"][input_name]:
+            print(
+                f"ERROR: We no longer support input-specific filtering with the '{key}' parameter.",
+                "Remove this parameter from your configuration file and try running the workflow again.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    return config["filter"].get(key, "")
 
 def _get_path_for_input(stage, origin_wildcard):
     """
@@ -40,61 +115,39 @@ def _get_path_for_input(stage, origin_wildcard):
     This function always returns a local filepath, the format of which lets snakemake decide
     whether to create it (via another rule) or use is as-is.
     """
-    path_or_url = config.get("inputs", {}).get(origin_wildcard, {}).get(stage, "")
-    scheme = urlsplit(path_or_url).scheme
-    remote = bool(scheme)
+    input_file = config.get("inputs", {}).get(origin_wildcard, {}).get(stage, "")
 
-    # Following checking should be the remit of the rule which downloads the remote resource
-    if scheme and scheme!="s3":
-        raise Exception(f"Input defined scheme {scheme} which is not yet supported.")
+    if input_file:
+        return path_or_url(input_file, keep_local=True)
 
-    if stage=="metadata":
-        if not path_or_url:
-            raise Exception(f"ERROR: config->input->{origin_wildcard}->metadata is not defined.")
-        return f"data/downloaded_{origin_wildcard}.tsv" if remote else path_or_url
-    if stage=="sequences":
-        if not path_or_url:
-            raise Exception(f"ERROR: config->input->{origin_wildcard}->sequences is not defined.")
-        return f"data/downloaded_{origin_wildcard}.fasta.xz" if remote else path_or_url
-    if stage=="aligned":
-        if remote:
-            return f"results/precomputed-aligned_{origin_wildcard}.fasta"
-        elif path_or_url:
-            return path_or_url
-        else:
-            return f"results/aligned_{origin_wildcard}.fasta.xz"
-    if stage=="masked":
-        if remote:
-            return f"results/precomputed-masked_{origin_wildcard}.fasta"
-        elif path_or_url:
-            return path_or_url
-        else:
-            return f"results/masked_{origin_wildcard}.fasta.xz"
-    if stage=="filtered":
-        if remote:
-            return f"results/precomputed-filtered_{origin_wildcard}.fasta"
-        elif path_or_url:
-            return path_or_url
-        else:
-            return f"results/filtered_{origin_wildcard}.fasta.xz"
-
-    raise Exception(f"_get_path_for_input with unknown stage \"{stage}\"")
+    if stage in {"metadata", "sequences"}:
+        raise Exception(f"ERROR: config->input->{origin_wildcard}->{stage} is not defined.")
+    elif stage in {"aligned"}:
+        return f"results/{stage}_{origin_wildcard}.fasta.xz"
+    else:
+        raise Exception(f"_get_path_for_input with unknown stage \"{stage}\"")
 
 
 def _get_unified_metadata(wildcards):
     """
     Returns a single metadata file representing the input metadata file(s).
     If there was only one supplied metadata file in the `config["inputs"] dict`,
-    then that file is returned. Else "results/combined_metadata.tsv" is returned
-    which will run the `combine_input_metadata` rule to make it.
+    then that file is run through `sanitize_metadata` and the new file name returned.
+    Else "results/combined_metadata.tsv.xz" is returned which will run the
+    `combine_input_metadata` rule (and `sanitize_metadata` rule) to make it.
     """
     if len(list(config["inputs"].keys()))==1:
-        return "results/sanitized_metadata_{origin}.tsv.xz".format(origin=list(config["inputs"].keys())[0])
+        input_name, input_record = list(config["inputs"].items())[0]
+        if input_record.get("skip_sanitize_metadata"):
+            return _get_path_for_input("metadata", input_name)
+        else:
+            return "results/sanitized_metadata_{origin}.tsv.xz".format(origin=input_name)
+
     return "results/combined_metadata.tsv.xz"
 
 def _get_unified_alignment(wildcards):
     if len(list(config["inputs"].keys()))==1:
-        return _get_path_for_input("filtered", list(config["inputs"].keys())[0])
+        return _get_path_for_input("aligned", list(config["inputs"].keys())[0])
     return "results/combined_sequences_for_subsampling.fasta.xz",
 
 def _get_metadata_by_build_name(build_name):
@@ -115,18 +168,6 @@ def _get_metadata_by_wildcards(wildcards):
     """
     return _get_metadata_by_build_name(wildcards.build_name)
 
-def _get_sampling_trait_for_wildcards(wildcards):
-    if wildcards.build_name in config["exposure"]:
-        return config["exposure"][wildcards.build_name]["trait"]
-    else:
-        return config["exposure"]["default"]["trait"]
-
-def _get_exposure_trait_for_wildcards(wildcards):
-    if wildcards.build_name in config["exposure"]:
-        return config["exposure"][wildcards.build_name]["exposure"]
-    else:
-        return config["exposure"]["default"]["exposure"]
-
 def _get_trait_columns_by_wildcards(wildcards):
     if wildcards.build_name in config["traits"]:
         return config["traits"][wildcards.build_name]["columns"]
@@ -140,7 +181,9 @@ def _get_sampling_bias_correction_for_wildcards(wildcards):
         return config["traits"]["default"]["sampling_bias_correction"]
 
 def _get_min_date_for_frequencies(wildcards):
-    if "frequencies" in config and "min_date" in config["frequencies"]:
+    if wildcards.build_name in config["frequencies"] and "min_date" in config["frequencies"][wildcards.build_name]:
+        return config["frequencies"][wildcards.build_name]["min_date"]
+    elif "frequencies" in config and "min_date" in config["frequencies"]:
         return config["frequencies"]["min_date"]
     else:
         # If not explicitly specified, default to 1 year back from the present
@@ -150,7 +193,9 @@ def _get_min_date_for_frequencies(wildcards):
         )
 
 def _get_max_date_for_frequencies(wildcards):
-    if "frequencies" in config and "max_date" in config["frequencies"]:
+    if wildcards.build_name in config["frequencies"] and "max_date" in config["frequencies"][wildcards.build_name]:
+        return config["frequencies"][wildcards.build_name]["max_date"]
+    elif "frequencies" in config and "max_date" in config["frequencies"]:
         return config["frequencies"]["max_date"]
     else:
         # Allow users to censor the N most recent days to minimize effects of
@@ -159,13 +204,13 @@ def _get_max_date_for_frequencies(wildcards):
         offset = datetime.timedelta(days=recent_days_to_censor)
 
         return numeric_date(
-            date.today() - offset
+            datetime.date.today() - offset
         )
 
 def _get_upload_inputs(wildcards):
     # The main workflow supports multiple inputs/origins, but our desired file
     # structure under data.nextstrain.org/files/ncov/open/… is designed around
-    # a single input/origin.  Intermediates (aligned, masked, filtered, etc)
+    # a single input/origin.  Intermediates (aligned, etc)
     # are specific to each input/origin and thus do not match our desired
     # structure, while builds (global, europe, africa, etc) span all
     # inputs/origins (and thus do).  In our desired outcome, the two kinds of
@@ -178,23 +223,35 @@ def _get_upload_inputs(wildcards):
 
     origin = config["S3_DST_ORIGINS"][0]
 
+    # This function bakes in these assumptions here about the build names used
+    # for the nextstrain.org/ncov/gisaid and …/open builds and then
+    # special-cases them below.
+    regions = {"global", "africa", "asia", "europe", "north-america", "oceania", "south-america"}
+    timespans = {"2m", "6m", "all-time"}
+    region_timespan_builds = [f"{region}_{timespan}" for region, timespan in product(regions, timespans)]
+
     # mapping of remote → local filenames
-    uploads = {
-        f"aligned.fasta.xz":              f"results/aligned_{origin}.fasta.xz",              # from `rule align`
-        f"masked.fasta.xz":               f"results/masked_{origin}.fasta.xz",               # from `rule mask`
-        f"filtered.fasta.xz":             f"results/filtered_{origin}.fasta.xz",             # from `rule filter`
-        f"mutation-summary.tsv.xz":       f"results/mutation_summary_{origin}.tsv.xz",       # from `rule mutation_summary`
-    }
-
+    build_files = {}
     for build_name in config["builds"]:
-        uploads.update({
-            f"{build_name}/sequences.fasta.xz": f"results/{build_name}/{build_name}_subsampled_sequences.fasta.xz",   # from `rule combine_samples`
-            f"{build_name}/metadata.tsv.xz":    f"results/{build_name}/{build_name}_subsampled_metadata.tsv.xz",      # from `rule combine_samples`
-            f"{build_name}/aligned.fasta.xz":   f"results/{build_name}/aligned.fasta.xz",                             # from `rule build_align`
-            # export the auspice dataset which matches the subsampled sequences / metadata (see `rule finalize`)
-            f"{build_name}/{build_name}.json":                  f"auspice/{config['auspice_json_prefix']}_{build_name}.json",
-            f"{build_name}/{build_name}_tip-frequencies.json":  f"auspice/{config['auspice_json_prefix']}_{build_name}_tip-frequencies.json",
-            f"{build_name}/{build_name}_root-sequence.json":    f"auspice/{config['auspice_json_prefix']}_{build_name}_root-sequence.json"
-        })
+        if build_name in region_timespan_builds:
+            region, timespan = build_name.split("_")
 
-    return uploads
+            # We name remote files only by region (for now), so only include
+            # the 6m timespan builds.
+            if timespan != "6m":
+                continue
+
+            upload_name = region
+        else:
+            upload_name = build_name
+
+        build_files.update({
+            f"{upload_name}/sequences.fasta.xz": f"results/{build_name}/{build_name}_subsampled_sequences.fasta.xz",   # from `rule combine_samples`
+            f"{upload_name}/metadata.tsv.xz":    f"results/{build_name}/{build_name}_subsampled_metadata.tsv.xz",      # from `rule combine_samples`
+            f"{upload_name}/aligned.fasta.xz":   f"results/{build_name}/aligned.fasta.xz",                             # from `rule build_align`
+            # export the auspice dataset which matches the subsampled sequences / metadata (see `rule finalize`)
+            f"{upload_name}/{upload_name}.json":                  f"auspice/{config['auspice_json_prefix']}_{build_name}.json",
+            f"{upload_name}/{upload_name}_tip-frequencies.json":  f"auspice/{config['auspice_json_prefix']}_{build_name}_tip-frequencies.json",
+            f"{upload_name}/{upload_name}_root-sequence.json":    f"auspice/{config['auspice_json_prefix']}_{build_name}_root-sequence.json"
+        })
+    return build_files
